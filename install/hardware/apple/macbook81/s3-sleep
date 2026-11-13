@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# systemd-sleep hook: restore LPSS clock/reset/interrupt mask after deep S3.
+# On this hardware suspend leaves GSPI and Bluetooth UART in reset; Linux's
+# PCI-mode drivers do not restore private LPSS state. Tested upstream on Fedora;
+# this independent Omarchy integration requires physical revalidation.
+
+set -o pipefail
+
+SPI=0000:00:15.4
+UART=0000:00:15.5
+SPI_DRV=/sys/bus/pci/drivers/pxa2xx_spi_pci
+BT_DRV=/sys/bus/serial/drivers/hci_uart_bcm
+RUN=/run/omarchy-macbook81
+LPSS=/usr/local/lib/omarchy/macbook81/lpss.py
+log() { logger -t omarchy-macbook81-s3 -- "$*"; }
+
+[[ $(cat /sys/class/dmi/id/product_name 2>/dev/null) == MacBook8,1 ]] || exit 0
+[[ -r /sys/power/mem_sleep ]] && grep -Fq '[deep]' /sys/power/mem_sleep || exit 0
+case "${2:-}" in suspend|hybrid-sleep|suspend-then-hibernate) ;; *) exit 0 ;; esac
+
+spi_ok() { grep -Fq 'Apple SPI Keyboard' /proc/bus/input/devices 2>/dev/null; }
+bt_enabled() {
+  [[ -e /sys/bus/pci/devices/$UART ]] &&
+    grep -qw 'iomem=relaxed' /proc/cmdline &&
+    [[ -f /etc/limine-entry-tool.d/macbook81-bluetooth-s3.conf ]]
+}
+
+case "${1:-}" in
+  pre)
+    mkdir -p "$RUN"
+    rm -f "$RUN/prepared" "$RUN/spi.regs" "$RUN/uart.regs" "$RUN/bt.name" "$RUN/bt-devices"
+    if ! modprobe -r applespi; then
+      log 'Could not unload applespi before S3; use s2idle for this suspend'
+      echo s2idle > /sys/power/mem_sleep || true
+      exit 0
+    fi
+    if [[ -L /sys/bus/pci/devices/$SPI/driver ]]; then
+      if ! echo "$SPI" > "$SPI_DRV/unbind"; then
+        log 'SPI unbind failed; reloading applespi and selecting s2idle'
+        modprobe applespi || true
+        echo s2idle > /sys/power/mem_sleep || true
+        exit 0
+      fi
+    fi
+    if ! python3 "$LPSS" save "$SPI" "$RUN/spi.regs" 2>&1 | logger -t omarchy-macbook81-s3; then
+      log 'SPI private registers could not be saved'
+      echo "$SPI" > "$SPI_DRV/bind" 2>/dev/null || true
+      modprobe applespi || true
+      echo s2idle > /sys/power/mem_sleep || true
+      exit 0
+    fi
+    if bt_enabled; then
+      if python3 "$LPSS" save "$UART" "$RUN/uart.regs" 2>&1 | logger -t omarchy-macbook81-s3; then
+        bluetoothctl devices Connected 2>/dev/null | awk '$2 ~ /^[0-9A-Fa-f:]+$/ {print $2}' > "$RUN/bt-devices" || true
+        for bt in "$BT_DRV"/serial*; do
+          [[ -L $bt ]] || continue
+          echo "${bt##*/}" > "$RUN/bt.name"
+          echo "${bt##*/}" > "$BT_DRV/unbind" || log 'Bluetooth serdev unbind failed'
+        done
+      else
+        log 'Bluetooth UART save failed, skipping UART restore'
+      fi
+    fi
+    touch "$RUN/prepared"
+    log 'S3 LPSS context saved'
+    ;;
+  post)
+    [[ -f "$RUN/prepared" ]] || exit 0
+    rm -f "$RUN/prepared"
+    # Restore PCI memory decode before accessing BAR0. The device was previously
+    # powered and unbound, and the original firmware MMIO values were saved.
+    setpci -s "${SPI#0000:}" COMMAND.w=0006 || log 'setpci failed'
+    if ! python3 "$LPSS" restore "$SPI" "$RUN/spi.regs" 2>&1 | logger -t omarchy-macbook81-s3; then
+      log 'SPI LPSS restore failed'
+      echo s2idle > /sys/power/mem_sleep || true
+    fi
+    if [[ ! -L /sys/bus/pci/devices/$SPI/driver ]]; then
+      echo "$SPI" > "$SPI_DRV/bind" || log 'SPI rebind failed'
+    fi
+    modprobe applespi || log 'applespi reload failed'
+    if bt_enabled && [[ -f "$RUN/uart.regs" ]]; then
+      python3 "$LPSS" restore "$UART" "$RUN/uart.regs" 2>&1 | logger -t omarchy-macbook81-s3 || log 'Bluetooth LPSS restore failed'
+      if [[ -s "$RUN/bt.name" ]]; then
+        btdev=$(cat "$RUN/bt.name")
+        [[ $btdev =~ ^serial[0-9]+-[0-9]+$ ]] && echo "$btdev" > "$BT_DRV/bind" || log 'Bluetooth rebind failed'
+      fi
+    fi
+    if [[ -s "$RUN/bt-devices" ]] && command -v systemd-run >/dev/null; then
+      systemd-run --quiet --no-block --collect --unit=omarchy-macbook81-bt-reconnect \
+        /usr/local/lib/omarchy/macbook81/bt-reconnect || log 'Bluetooth reconnect scheduling failed'
+    fi
+    restored=0
+    for n in {1..12}; do
+      if spi_ok; then restored=1; break; fi
+      sleep 0.25
+    done
+    if (( restored )); then
+      log 'applespi OK after deep S3'
+    else
+      log 'applespi did not return; switching to s2idle until next reboot'
+      echo s2idle > /sys/power/mem_sleep || true
+    fi
+    ;;
+esac
+exit 0

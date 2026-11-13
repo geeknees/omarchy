@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Transient systemd job, scheduled after S3 resume (outside system-sleep scope).
+# Give the CS4208 speaker recovery and PipeWire time to start before reconnect.
+set -u
+LIST=/run/omarchy-macbook81/bt-devices
+[[ -s $LIST ]] || exit 0
+sleep 15
+if systemctl cat mb81-resume-recover.service >/dev/null 2>&1; then
+  for i in {1..30}; do
+    systemctl is-active --quiet mb81-resume-recover.service || break
+    sleep 1
+  done
+fi
+while read -r addr; do
+  [[ $addr =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || continue
+  for attempt in 1 2 3; do
+    bluetoothctl --timeout 12 connect "$addr" >/dev/null 2>&1 && break
+    sleep 3
+  done
+done < "$LIST"
+rm -f "$LIST"

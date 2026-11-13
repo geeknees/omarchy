@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Add the host's patched DSDT to the EARLY, uncompressed CPIO (including UKIs).
+build() {
+  if ! declare -F add_file_early >/dev/null 2>&1; then
+    error 'mkinitcpio >= 38 with add_file_early is required'
+    return 1
+  fi
+  add_file_early /var/lib/omarchy/macbook81/acpi/dsdt.aml /kernel/firmware/acpi/dsdt.aml 644
+}
+help() {
+  cat <<'EOT'
+MacBook8,1 Bluetooth DSDT override to let Broadcom hci_bcm bind to the UART.
+EOT
+}

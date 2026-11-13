@@ -5,10 +5,14 @@ product_name="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
 if [[ $product_name =~ MacBook[89],1|MacBook1[02],1|MacBookPro13,[123]|MacBookPro14,[123] ]]; then
   echo "Detected MacBook with SPI keyboard"
 
-  omarchy-pkg-add macbook12-spi-driver-dkms
+  # MacBook8,1 uses the in-kernel applespi driver; the legacy DKMS package
+  # fails to build against modern kernels. Leave other models unchanged.
+  if [[ $product_name != "MacBook8,1" ]]; then
+    omarchy-pkg-add macbook12-spi-driver-dkms
+  fi
   sudo mkdir -p /etc/mkinitcpio.conf.d
   if [[ $product_name == "MacBook8,1" ]]; then
-    echo "MODULES=(applespi spi_pxa2xx_platform spi_pxa2xx_pci)" | \
+    echo "MODULES+=(applespi spi_pxa2xx_platform spi_pxa2xx_pci)" | \
       sudo tee /etc/mkinitcpio.conf.d/macbook_spi_modules.conf >/dev/null
   else
     echo "MODULES=(applespi intel_lpss_pci spi_pxa2xx_platform)" | \

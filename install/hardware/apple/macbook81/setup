@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# MacBook8,1 integration for Arch/Omarchy. No third-party driver source is vendored.
+set -euo pipefail
+
+LIB=/usr/local/lib/omarchy/macbook81
+STATE=/var/lib/omarchy/macbook81
+BOOT=/etc/limine-entry-tool.d/macbook81.conf
+BT_BOOT=/etc/limine-entry-tool.d/macbook81-bluetooth-s3.conf
+MODS=/etc/mkinitcpio.conf.d/macbook81-spi.conf
+SLEEP_HOOK=/usr/lib/systemd/system-sleep/omarchy-macbook81-s3
+ACPI_HOOK=/etc/initcpio/install/omarchy-macbook81-acpi
+ACPI_CONF=/etc/mkinitcpio.conf.d/macbook81-acpi.conf
+ACPI_AML=$STATE/acpi/dsdt.aml
+SPEAKER_REPO=https://github.com/omnidecker/macbook8.1-speaker-driver.git
+SPEAKER_REV=e4134fb272ba3be29aa71ad7aa6eae8b0ebddf1a
+CAMERA_REPO=https://github.com/patjak/facetimehd.git
+CAMERA_REV=4e588ae9cff35af958c0af5307ef2cd00ea6b2e3
+FW_REPO=https://github.com/patjak/facetimehd-firmware.git
+FW_REV=961774dc3bbcb77c5b1ed257b179fb37d0d9534e
+FW_SHA256=240ef2e991f1d089d8228ce11d92b66bfa4b3d7289ec4fee228b64a713024330
+CAMERA_VERSION=0.7.0.1
+
+say() { printf '[macbook81] %s\n' "$*"; }
+fail() { printf '[macbook81] ERROR: %s\n' "$*" >&2; exit 1; }
+warn() { printf '[macbook81] WARNING: %s\n' "$*" >&2; }
+model() { cat "${MB81_DMI_PATH:-/sys/class/dmi/id/product_name}" 2>/dev/null || true; }
+require_model() { [[ $(model) == MacBook8,1 ]] || fail "Only MacBook8,1 is supported (found: $(model))"; }
+require_root() { (( EUID == 0 )) || fail 'Run with sudo'; }
+need() { command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1"; }
+
+rebuild_boot() {
+  [[ ${MB81_DEFER_REBUILD:-0} == 1 ]] && { say 'UKI rebuild deferred to installer'; return; }
+  if command -v limine-mkinitcpio >/dev/null 2>&1; then
+    limine-mkinitcpio
+  elif command -v limine-update >/dev/null 2>&1; then
+    limine-update
+  else
+    fail 'Limine rebuild tool not found; boot image has NOT been updated'
+  fi
+}
+
+# Keep the upstream repos separate, pinned and auditable. Never pipe downloaded
+# scripts into a root shell. The revision IDs are deliberately fixed.
+checkout_pinned() {
+  local url=$1 rev=$2 dest=$3
+  need git
+  if [[ -d "$dest/.git" ]] && [[ $(git -C "$dest" rev-parse HEAD) == "$rev" ]]; then
+    say "Using pinned checkout: $dest"
+    return
+  fi
+  [[ ! -e "$dest" ]] || fail "Checkout exists with a different revision: $dest (move it aside manually)"
+  mkdir -p "$(dirname "$dest")"
+  GIT_TERMINAL_PROMPT=0 git init -q "$dest"
+  git -C "$dest" remote add origin "$url"
+  GIT_TERMINAL_PROMPT=0 git -C "$dest" fetch -q --depth 1 origin "$rev"
+  git -C "$dest" checkout -q --detach "$rev"
+  [[ $(git -C "$dest" rev-parse HEAD) == "$rev" ]] || fail "Revision mismatch: $url"
+}
+
+kernel_headers_package() {
+  local pkgbase
+  pkgbase=$(cat "/usr/lib/modules/$(uname -r)/pkgbase" 2>/dev/null || true)
+  [[ -n $pkgbase ]] || pkgbase=linux
+  printf '%s-headers\n' "$pkgbase"
+}
+prepare_dkms() {
+  need pacman
+  pacman -S --needed --noconfirm base-devel dkms git wget python xz curl "$(kernel_headers_package)"
+  [[ -e /lib/modules/$(uname -r)/build ]] || fail 'Running kernel headers unavailable; reboot into installed kernel or install matching headers'
+}
+
+write_boot() {
+  local mode=$1
+  mkdir -p /etc/limine-entry-tool.d
+  cat > "$BOOT" <<EOT
+# MacBook8,1: Intel LPSS DMA fails for the Apple SPI keyboard/trackpad.
+# PIO workaround: https://github.com/omacom/omarchy/pull/9735
+KERNEL_CMDLINE[default]+=" initcall_blacklist=dw_pci_driver_init mem_sleep_default=$mode"
+EOT
+}
+
+cmd_base() {
+  require_root
+  mkdir -p "$STATE" /etc/mkinitcpio.conf.d /etc/modprobe.d /etc/systemd/sleep.conf.d
+  # Do not undo a user-tested deep sleep choice when an Omarchy update reapplies base.
+  local sleep_mode=s2idle
+  [[ -f "$BOOT" ]] && grep -q 'mem_sleep_default=deep' "$BOOT" && sleep_mode=deep
+  write_boot "$sleep_mode"
+  # Repair the precise old Omarchy-generated assignment on existing installs.
+  if [[ -f /etc/mkinitcpio.conf.d/macbook_spi_modules.conf ]] &&
+      grep -qx 'MODULES=(applespi spi_pxa2xx_platform spi_pxa2xx_pci)' /etc/mkinitcpio.conf.d/macbook_spi_modules.conf; then
+    echo 'MODULES+=(applespi spi_pxa2xx_platform spi_pxa2xx_pci)' > /etc/mkinitcpio.conf.d/macbook_spi_modules.conf
+  fi
+  cat > "$MODS" <<'EOT'
+# Add to existing initramfs modules; don't overwrite user or installer settings.
+MODULES+=(applespi spi_pxa2xx_platform spi_pxa2xx_pci)
+EOT
+  cat > /etc/modprobe.d/macbook81-dma.conf <<'EOT'
+# Applies if dw_dmac_pci is a module; built-in Arch kernels use the boot arg.
+blacklist dw_dmac_pci
+EOT
+  install -Dm755 "$LIB/s3-sleep" "$SLEEP_HOOK"
+  cat > /etc/systemd/sleep.conf.d/80-macbook81.conf <<'EOT'
+[Sleep]
+# ACPI S4 platform hibernate may hang on this MacBook.
+HibernateMode=shutdown
+EOT
+  cmd_wifi
+  rebuild_boot
+  say "SPI PIO, Wi-Fi and S3 recovery hook installed. Default sleep: $sleep_mode"
+}
+
+cmd_wifi() {
+  require_root
+  local found=0
+  compgen -G '/usr/lib/firmware/brcm/brcmfmac43602-pcie.bin*' >/dev/null && found=1
+  if (( ! found )) && command -v pacman >/dev/null 2>&1; then
+    pacman -S --needed --noconfirm linux-firmware-broadcom || warn 'Could not install Broadcom firmware automatically'
+  fi
+  compgen -G '/usr/lib/firmware/brcm/brcmfmac43602-pcie.bin*' >/dev/null || warn 'Broadcom BCM43602 firmware not found; check Wi-Fi after reboot'
+  mkdir -p /etc/NetworkManager/conf.d
+  cat > /etc/NetworkManager/conf.d/90-macbook81-wifi.conf <<'EOT'
+[connection]
+# Avoid BCM43602 disconnects during power saving.
+wifi.powersave=2
+EOT
+  say 'Wi-Fi setup complete (Omarchy also configures brcmfmac WPA offload)'
+}
+
+cmd_s3() {
+  require_root
+  [[ -f "$SLEEP_HOOK" ]] || fail 'Run base first'
+  [[ -r /sys/power/mem_sleep ]] && grep -qw deep /sys/power/mem_sleep || warn 'deep is not currently offered by the kernel; enabling may not work'
+  case "$1" in
+    enable) say 'Enable only after a successful MANUAL S3 test with external keyboard/SSH'; write_boot deep ;;
+    disable) write_boot s2idle ;;
+    *) fail 's3 accepts enable or disable' ;;
+  esac
+  rebuild_boot
+  say "S3 boot preference set to $1; reboot to take effect"
+}
+
+cmd_bt_s3() {
+  require_root
+  case "$1" in
+    enable)
+      [[ -e "$ACPI_AML" ]] || fail 'Install Bluetooth DSDT first'
+      mkdir -p /etc/limine-entry-tool.d
+      cat > "$BT_BOOT" <<'EOT'
+# opt-in only: permits LPSS UART MMIO restore while Bluetooth is bound.
+# iomem=relaxed weakens /dev/mem protection for processes with root privileges.
+KERNEL_CMDLINE[default]+=" iomem=relaxed"
+EOT
+      ;;
+    disable) rm -f "$BT_BOOT" ;;
+    *) fail 'bluetooth-s3 accepts enable or disable' ;;
+  esac
+  rebuild_boot
+  say "Bluetooth S3 register restore setting: $1 (requires reboot)"
+}
+
+cmd_speakers() {
+  require_root
+  [[ -n ${SUDO_USER:-} && ${SUDO_USER:-} != root ]] || fail 'Run with sudo from the desktop user account (config is per-user)'
+  prepare_dkms
+  pacman -S --needed --noconfirm rtkit
+  checkout_pinned "$SPEAKER_REPO" "$SPEAKER_REV" "$STATE/speaker-driver"
+  python3 "$LIB/speaker-adjust.py" "$STATE/speaker-driver"
+  ( cd "$STATE/speaker-driver" && bash install.sh )
+  rebuild_boot # upstream assumes update-initramfs, which Omarchy does not have
+  touch "$STATE/speakers-installed"
+  say 'Speakers installed via pinned external DKMS code. Reboot and check wpctl status.'
+}
+
+cmd_speakers_remove() {
+  require_root
+  [[ -f "$STATE/speaker-driver/install.sh" ]] || fail 'Pinned speaker checkout not found'
+  ( cd "$STATE/speaker-driver" && bash install.sh -r )
+  rebuild_boot
+  rm -f "$STATE/speakers-installed"
+}
+
+cmd_camera() {
+  require_root
+  if [[ -e "$STATE/camera-installed" ]] && dkms status -m facetimehd -v "$CAMERA_VERSION" 2>/dev/null | grep -q 'installed'; then
+    say 'FaceTime HD DKMS already installed; no changes'
+    return
+  fi
+  prepare_dkms
+  need sha256sum
+  checkout_pinned "$CAMERA_REPO" "$CAMERA_REV" "$STATE/camera-driver"
+  checkout_pinned "$FW_REPO" "$FW_REV" "$STATE/camera-firmware-source"
+  # Upstream's Makefile uses curl -k; use ordinary verified TLS, then independently
+  # verify the extracted firmware hash. No copyrighted firmware is vendored.
+  local work
+  work=$(mktemp -d)
+  trap "rm -rf -- '$work'" EXIT
+  cp -a "$STATE/camera-firmware-source/." "$work/"
+  sed -i 's/curl -k /curl /g' "$work/Makefile"
+  ( cd "$work" && make FW_VER=5.60.0 )
+  echo "$FW_SHA256  $work/firmware.bin" | sha256sum -c - || fail 'Camera firmware hash mismatch'
+  install -d /usr/lib/firmware/facetimehd
+  install -m644 "$work/firmware.bin" /usr/lib/firmware/facetimehd/firmware.bin
+  local sensor count=0
+  for sensor in "$work"/*_01XX.dat; do
+    [[ -f "$sensor" ]] || continue
+    install -m644 "$sensor" /usr/lib/firmware/facetimehd/
+    (( count+=1 ))
+  done
+  (( count > 0 )) || fail 'Camera calibration files are missing'
+  local src=/usr/src/facetimehd-$CAMERA_VERSION
+  [[ ! -e "$src" ]] || fail "$src exists; do not overwrite another DKMS installation"
+  cp -a "$STATE/camera-driver" "$src"
+  dkms add -m facetimehd -v "$CAMERA_VERSION"
+  dkms build -m facetimehd -v "$CAMERA_VERSION" -k "$(uname -r)"
+  dkms install -m facetimehd -v "$CAMERA_VERSION" -k "$(uname -r)"
+  install -d /etc/modprobe.d
+  cat > /etc/modprobe.d/90-macbook81-facetimehd.conf <<'EOT'
+# Prevent Broadcom USB controller from claiming the FaceTime HD PCI device.
+blacklist bdc_pci
+EOT
+  rebuild_boot
+  touch "$STATE/camera-installed"
+  rm -rf -- "$work"
+  say 'Camera installed. Reboot and verify /dev/video* and kernel logs.'
+}
+
+cmd_camera_remove() {
+  require_root
+  [[ -e "$STATE/camera-installed" ]] || fail 'No record of a camera install by this tool'
+  dkms remove -m facetimehd -v "$CAMERA_VERSION" --all
+  rm -f /etc/modprobe.d/90-macbook81-facetimehd.conf
+  rm -f "$STATE/camera-installed"
+  rebuild_boot
+  say 'Camera driver removed; extracted firmware left in place'
+}
+
+cmd_bluetooth() {
+  require_root
+  need python3
+  pacman -S --needed --noconfirm acpica
+  need iasl
+  [[ -r /sys/firmware/acpi/tables/DSDT ]] || fail 'Cannot read original DSDT'
+  # Rebuild the table from THIS machine. Never ship someone else's DSDT.
+  local temp
+  temp=$(mktemp -d)
+  trap "rm -rf -- '$temp'" EXIT
+  [[ -d /sys/bus/acpi/devices/BCM2E7C:00 ]] || fail 'Broadcom Bluetooth ACPI device BCM2E7C:00 is absent'
+  cp /sys/firmware/acpi/tables/DSDT "$temp/dsdt.dat"
+  ( cd "$temp" && iasl -d dsdt.dat )
+  python3 "$LIB/acpi-edit.py" "$temp/dsdt.dsl" "$temp/patched.dsl"
+  ( cd "$temp" && iasl -ve -tc patched.dsl )
+  [[ -s "$temp/patched.aml" ]] || fail 'The ACPI compiler did not produce an AML file'
+  install -Dm644 "$temp/patched.aml" "$ACPI_AML"
+  install -Dm644 "$temp/dsdt.dat" "$STATE/acpi/original-dsdt.dat"
+  install -Dm644 "$temp/patched.dsl" "$STATE/acpi/patched.dsl"
+  install -Dm644 "$LIB/initcpio-acpi" "$ACPI_HOOK"
+  cat > "$ACPI_CONF" <<'EOT'
+# Embed the table in the early uncompressed initramfs (works inside UKI).
+HOOKS+=(omarchy-macbook81-acpi)
+EOT
+  rebuild_boot
+  rm -rf "$temp"
+  say 'Bluetooth DSDT installed. Reboot; check dmesg ACPI: Table Upgrade and hci0.'
+}
+
+cmd_bluetooth_remove() {
+  require_root
+  rm -f "$ACPI_CONF" "$ACPI_HOOK" "$BT_BOOT"
+  # Leave source/backup in STATE for later inspection, but the hook no longer
+  # injects the override; removal is effective after rebuilding and rebooting.
+  rebuild_boot
+  say 'Bluetooth override removed from boot; backup kept in state directory'
+}
+
+cmd_status() {
+  say "Model: $(model)"
+  say "Kernel: $(uname -r)"
+  say "DMA workaround: $(grep -o 'initcall_blacklist=[^ ]*' /proc/cmdline 2>/dev/null || echo absent)"
+  say "Sleep: $(cat /sys/power/mem_sleep 2>/dev/null || echo unavailable)"
+  for item in "$BOOT" "$SLEEP_HOOK" "$ACPI_CONF" "$BT_BOOT" "$STATE/speakers-installed" "$STATE/camera-installed"; do
+    [[ -e "$item" ]] && say "present: $item" || say "absent: $item"
+  done
+  say 'Driver state:'
+  modinfo -n applespi snd-hda-intel facetimehd 2>/dev/null || true
+  ls -d /sys/class/bluetooth/hci* /dev/video* 2>/dev/null || true
+}
+
+cmd_remove_base() {
+  require_root
+  rm -f "$BOOT" "$MODS" "$SLEEP_HOOK" /etc/modprobe.d/macbook81-dma.conf \
+        /etc/systemd/sleep.conf.d/80-macbook81.conf \
+        /etc/NetworkManager/conf.d/90-macbook81-wifi.conf
+  rebuild_boot
+  say 'Base workarounds removed. A USB keyboard may be needed on the next boot.'
+}
+
+usage() {
+  cat <<'EOT'
+Usage: sudo omarchy-macbook81 COMMAND
+
+  base                  SPI keyboard/trackpad, Wi-Fi, suspend recovery (safe default)
+  all                   base + speakers + camera + Bluetooth DSDT (S3 still opt-in)
+  wifi                  firmware check and NetworkManager power setting
+  speakers              install pinned external DKMS speaker driver (per-user audio)
+  speakers-remove       uninstall speaker driver
+  camera                extract verified Apple firmware; install facetimehd DKMS
+  camera-remove         remove installed facetimehd module
+  bluetooth             build this machine's DSDT without SSDC; install early cpio
+  bluetooth-remove      disable DSDT override
+  s3-enable             boot into deep sleep (ONLY after successful manual test)
+  s3-disable            boot into s2idle
+  bluetooth-s3-enable   opt in to iomem=relaxed for UART resume
+  bluetooth-s3-disable  remove iomem=relaxed
+  status                show system state (read-only)
+  remove-base           remove this patch's core configuration
+
+Review external driver repositories and licenses before using `all`.
+Use a USB keyboard or SSH for first S3 tests, and keep backups before installs.
+EOT
+}
+
+case "${1:-help}" in
+  help|--help|-h) usage ;;
+  status) require_model; cmd_status ;;
+  *)
+    require_model
+    require_root
+    case "${1:-}" in
+      base) cmd_base ;;
+      wifi) cmd_wifi ;;
+      all) cmd_base; cmd_speakers; cmd_camera; cmd_bluetooth ;;
+      speakers) cmd_speakers ;;
+      speakers-remove) cmd_speakers_remove ;;
+      camera) cmd_camera ;;
+      camera-remove) cmd_camera_remove ;;
+      bluetooth) cmd_bluetooth ;;
+      bluetooth-remove) cmd_bluetooth_remove ;;
+      s3-enable) cmd_s3 enable ;;
+      s3-disable) cmd_s3 disable ;;
+      bluetooth-s3-enable) cmd_bt_s3 enable ;;
+      bluetooth-s3-disable) cmd_bt_s3 disable ;;
+      remove-base) cmd_remove_base ;;
+      *) usage; exit 2 ;;
+    esac
+    ;;
+esac
